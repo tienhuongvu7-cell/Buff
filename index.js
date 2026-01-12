@@ -1,51 +1,70 @@
 /**
- * SMM BUFF API - NODEJS EDITION
+ * SMM BUFF API - NODEJS EDITION (FIXED FOR RENDER)
  * Created by CUONGDEVGPT
- * Load từ file trong thư mục, buff linh hoạt, không log API key
+ * Fix HTTP 502, load từ file trong thư mục, buff linh hoạt
  */
 
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 const https = require('https');
+const http = require('http');
 const url = require('url');
 
 // ============================================
 // CẤU HÌNH
 // ============================================
 const CONFIG = {
-    LOCAL_FILE: 'apireaction.txt',
+    LOCAL_FILE: path.join(__dirname, 'apireaction.txt'),
     SMM_API_URL: 'https://smm-center.com/api/v2',
     SERVICE_ID: 29117,
     MAX_ORDER_SIZE: 1000,
     MIN_ORDER_SIZE: 1,
-    REQUEST_TIMEOUT: 15000,
-    MAX_CONCURRENT_REQUESTS: 5
+    REQUEST_TIMEOUT: 10000,
+    MAX_CONCURRENT_REQUESTS: 3
 };
 
 // ============================================
-// FILE MANAGER
+// FILE MANAGER - FIX LOAD TỪ THƯ MỤC
 // ============================================
 class FileManager {
     constructor() {
-        this.filePath = path.join(__dirname, CONFIG.LOCAL_FILE);
+        this.filePath = CONFIG.LOCAL_FILE;
+        console.log(`📁 File path: ${this.filePath}`);
         this.ensureFile();
     }
 
     async ensureFile() {
         try {
             await fs.access(this.filePath);
+            console.log(`✅ File tồn tại: ${this.filePath}`);
         } catch (error) {
-            await fs.writeFile(this.filePath, '', 'utf8');
-            console.log('✅ Đã tạo file mới');
+            console.log(`⚠ File chưa có, tạo file mới...`);
+            try {
+                await fs.writeFile(this.filePath, '', 'utf8');
+                console.log(`✅ Đã tạo file: ${this.filePath}`);
+            } catch (writeError) {
+                console.error(`❌ Không thể tạo file: ${writeError.message}`);
+            }
         }
     }
 
     async loadKeys() {
         try {
+            // Kiểm tra file tồn tại
+            try {
+                await fs.access(this.filePath);
+            } catch {
+                console.log(`❌ File không tồn tại: ${this.filePath}`);
+                return { keys: [], total: 0, totalQty: 0 };
+            }
+
+            // Đọc file
             const content = await fs.readFile(this.filePath, 'utf8');
+            
             if (!content.trim()) {
-                return { keys: [], total: 0 };
+                console.log(`⚠ File rỗng: ${this.filePath}`);
+                return { keys: [], total: 0, totalQty: 0 };
             }
 
             const lines = content.trim().split('\n');
@@ -64,17 +83,21 @@ class FileManager {
 
                 keys.push({
                     key: apiKey,
-                    qty: qty
+                    qty: qty,
+                    originalLine: trimmed
                 });
             }
 
+            const totalQty = keys.reduce((sum, k) => sum + k.qty, 0);
+            console.log(`📊 Load thành công: ${keys.length} keys, ${totalQty} members`);
+            
             return {
                 keys: keys,
                 total: keys.length,
-                totalQty: keys.reduce((sum, k) => sum + k.qty, 0)
+                totalQty: totalQty
             };
         } catch (error) {
-            console.error('❌ Lỗi load keys:', error.message);
+            console.error(`❌ Lỗi load keys từ ${this.filePath}:`, error.message);
             return { keys: [], total: 0, totalQty: 0 };
         }
     }
@@ -89,34 +112,44 @@ class FileManager {
                     lines.push(`${key.key}|${key.qty}`);
                 } else {
                     deletedCount++;
-                    console.log(`🗑️ Xoá key: ${key.key.substring(0, 10)}... (qty = 0)`);
+                    console.log(`🗑️ Xoá key: ${key.key.substring(0, 8)}*** (qty = 0)`);
                 }
             }
 
-            console.log(`💾 Lưu file: ${lines.length} keys, xoá ${deletedCount} keys`);
+            console.log(`💾 Lưu file: ${lines.length} keys active, ${deletedCount} keys removed`);
 
             await fs.writeFile(this.filePath, lines.join('\n'), 'utf8');
             return true;
         } catch (error) {
-            console.error('❌ Lỗi save keys:', error.message);
+            console.error(`❌ Lỗi save keys:`, error.message);
             return false;
         }
     }
 
     async checkAllKeys() {
-        const data = await this.loadKeys();
-        const results = [];
+        try {
+            const data = await this.loadKeys();
+            const results = [];
+            
+            console.log(`🔍 Checking ${data.keys.length} keys...`);
 
-        for (const key of data.keys) {
-            const balance = await this.checkBalance(key.key);
-            results.push({
-                key: key.key.substring(0, 10) + '...',
-                qty_in_file: key.qty,
-                balance: balance !== null ? `$${balance}` : 'Lỗi check'
-            });
+            for (const key of data.keys) {
+                const balance = await this.checkBalance(key.key);
+                results.push({
+                    key: key.key.substring(0, 8) + '***',
+                    qty_in_file: key.qty,
+                    balance: balance !== null ? `$${balance}` : 'Lỗi check'
+                });
+                
+                // Delay giữa các request
+                await this.sleep(200);
+            }
+
+            return results;
+        } catch (error) {
+            console.error('❌ Lỗi check keys:', error.message);
+            return [];
         }
-
-        return results;
     }
 
     async checkBalance(apiKey) {
@@ -126,15 +159,17 @@ class FileManager {
                 action: 'balance'
             }).toString();
 
-            const req = https.request(CONFIG.SMM_API_URL, {
+            const options = {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Content-Length': Buffer.byteLength(postData),
-                    'User-Agent': 'NodeJS-SMM-Buffer'
+                    'User-Agent': 'NodeJS-SMM-Buffer/1.0'
                 },
-                timeout: CONFIG.REQUEST_TIMEOUT
-            }, (res) => {
+                timeout: 5000
+            };
+
+            const req = https.request(CONFIG.SMM_API_URL, options, (res) => {
                 let data = '';
                 res.on('data', (chunk) => data += chunk);
                 res.on('end', () => {
@@ -157,10 +192,14 @@ class FileManager {
             req.end();
         });
     }
+
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
 }
 
 // ============================================
-// BUFF ENGINE - XỬ LÝ LINH HOẠT
+// BUFF ENGINE - FIX XỬ LÝ LINH HOẠT
 // ============================================
 class BuffEngine {
     constructor() {
@@ -181,6 +220,8 @@ class BuffEngine {
             };
         }
 
+        console.log(`📊 Có ${keys.length} keys với ${keyData.totalQty} members`);
+
         if (keyData.totalQty < requestedQty) {
             return {
                 success: false,
@@ -195,7 +236,6 @@ class BuffEngine {
         let buffered = 0;
         let remainingNeeded = requestedQty;
         const usedKeys = new Map();
-        const successfulOrders = [];
 
         // Xử lý từng key
         for (const key of keys) {
@@ -204,7 +244,8 @@ class BuffEngine {
 
             const canUse = Math.min(key.qty, remainingNeeded);
             
-            // Buff số lượng chính xác, không chia 100
+            console.log(`🔄 Thử buff ${canUse} members từ key ${key.key.substring(0, 8)}***`);
+
             const result = await this.placeOrder(key.key, targetUrl, canUse);
             
             if (result.success) {
@@ -212,26 +253,21 @@ class BuffEngine {
                 key.qty -= canUse;
                 remainingNeeded -= canUse;
 
-                // Track usage (không log API key)
+                // Track usage (không log API key đầy đủ)
                 const keyMask = key.key.substring(0, 8) + '***';
                 usedKeys.set(keyMask, (usedKeys.get(keyMask) || 0) + canUse);
-                successfulOrders.push({
-                    order_id: result.order_id,
-                    qty: canUse
-                });
 
                 console.log(`✅ Buff ${canUse} members thành công (Order: ${result.order_id})`);
                 
-                // Nếu key hết, dừng ngay
                 if (key.qty <= 0) {
                     console.log(`⚠ Key ${keyMask} đã hết số lượng`);
                 }
             } else {
-                console.log(`❌ Buff ${canUse} members thất bại với key này`);
+                console.log(`❌ Buff ${canUse} members thất bại: ${result.error || 'Unknown error'}`);
             }
 
-            // Nghỉ chút giữa các request
-            await this.sleep(100);
+            // Delay giữa các request
+            await this.sleep(300);
         }
 
         // Tính remaining
@@ -278,15 +314,17 @@ class BuffEngine {
                 quantity: qty
             }).toString();
 
-            const req = https.request(CONFIG.SMM_API_URL, {
+            const options = {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Content-Length': Buffer.byteLength(postData),
-                    'User-Agent': 'NodeJS-SMM-Buffer'
+                    'User-Agent': 'NodeJS-SMM-Buffer/1.0'
                 },
                 timeout: CONFIG.REQUEST_TIMEOUT
-            }, (res) => {
+            };
+
+            const req = https.request(CONFIG.SMM_API_URL, options, (res) => {
                 let data = '';
                 res.on('data', (chunk) => data += chunk);
                 res.on('end', () => {
@@ -301,7 +339,7 @@ class BuffEngine {
                         } else {
                             resolve({
                                 success: false,
-                                error: result.error || 'Unknown error'
+                                error: result.error || 'Unknown error from SMM API'
                             });
                         }
                     } catch (error) {
@@ -339,28 +377,43 @@ class BuffEngine {
 }
 
 // ============================================
-// API SERVER
+// API SERVER - FIX HTTP 502
 // ============================================
 class ApiServer {
-    constructor(port = 3000) {
+    constructor(port = process.env.PORT || 3000) {
         this.port = port;
         this.buffEngine = new BuffEngine();
         this.fileMgr = new FileManager();
-        this.setupServer();
+        this.startServer();
     }
 
-    setupServer() {
-        const server = https.createServer((req, res) => {
+    startServer() {
+        // DÙNG HTTP SERVER, Render đã có HTTPS
+        const server = http.createServer((req, res) => {
             this.handleRequest(req, res);
         });
 
         server.listen(this.port, () => {
             console.log(`🚀 Server chạy trên port ${this.port}`);
             console.log(`📁 Đang đọc file: ${CONFIG.LOCAL_FILE}`);
+            console.log(`🌐 Endpoint: http://localhost:${this.port}/?url=...&soluong=...`);
+            console.log(`🔍 Check keys: http://localhost:${this.port}/?anhlamgimadeemkhoc`);
         });
 
         server.on('error', (error) => {
             console.error('❌ Lỗi server:', error.message);
+            if (error.code === 'EADDRINUSE') {
+                console.log(`⚠ Port ${this.port} đang được sử dụng`);
+            }
+        });
+
+        // Graceful shutdown
+        process.on('SIGTERM', () => {
+            console.log('🛑 Nhận SIGTERM, tắt server...');
+            server.close(() => {
+                console.log('✅ Server đã tắt');
+                process.exit(0);
+            });
         });
     }
 
@@ -391,8 +444,11 @@ class ApiServer {
             const parsedUrl = url.parse(req.url, true);
             const query = parsedUrl.query;
 
+            console.log(`📥 Request: ${req.url}`);
+
             // Special check command
             if (query.anhlamgimadeemkhoc) {
+                console.log('🔍 Yêu cầu check all keys');
                 const results = await this.fileMgr.checkAllKeys();
                 this.sendResponse(res, 200, {
                     success: true,
@@ -488,7 +544,16 @@ class ApiServer {
 // Start server
 if (require.main === module) {
     const PORT = process.env.PORT || 3000;
-    new ApiServer(PORT);
+    console.log(`🚀 Khởi động SMM Buff API...`);
+    console.log(`📍 PORT: ${PORT}`);
+    console.log(`📁 Workdir: ${__dirname}`);
+    
+    try {
+        new ApiServer(PORT);
+    } catch (error) {
+        console.error('❌ Không thể khởi động server:', error.message);
+        process.exit(1);
+    }
 }
 
 // ============================================
